@@ -189,7 +189,6 @@ name = "arm_gicv2"
 version = "0.1.0"
 source = "git+https://github.com/arceos-hypervisor/arm_gicv2#dfe5f164b94cdd07081c2fe74a0cfe4bef2852c9"
 dependencies = [
- "crate_interface",
  "tock-registers 0.8.1",
 ]
 
