@@ -21,6 +21,10 @@ pub struct TrapFrame {
     pub r14: u64,
     pub r15: u64,
 
+    // Set by `tls.rs`
+    pub fs_base: u64,
+    pub __pad: u64,
+
     // Pushed by `trap.S`
     pub vector: u64,
     pub error_code: u64,
@@ -67,6 +71,58 @@ impl TrapFrame {
     /// Whether the trap is from userspace.
     pub const fn is_user(&self) -> bool {
         self.cs & 0b11 == 3
+    }
+
+    /// Gets the instruction pointer.
+    pub const fn ip(&self) -> usize {
+        self.rip as _
+    }
+
+    /// Sets the instruction pointer.
+    pub const fn set_ip(&mut self, rip: usize) {
+        self.rip = rip as _;
+    }
+
+    /// Gets the stack pointer.
+    pub const fn sp(&self) -> usize {
+        self.rsp as _
+    }
+
+    /// Sets the stack pointer.
+    pub const fn set_sp(&mut self, rsp: usize) {
+        self.rsp = rsp as _;
+    }
+
+    /// Gets the return value register.
+    pub const fn retval(&self) -> usize {
+        self.rax as _
+    }
+
+    /// Sets the return value register.
+    pub const fn set_retval(&mut self, rax: usize) {
+        self.rax = rax as _;
+    }
+
+    /// Push the return address.
+    ///
+    /// On x86_64, return address is stored in stack, so we need to modify the
+    /// stack in order to change the return address. This function uses a
+    /// separate name (rather than `set_ra`) to avoid confusion and misuse.
+    pub fn push_ra(&mut self, addr: usize) {
+        self.rsp -= 8;
+        unsafe {
+            core::ptr::write(self.rsp as *mut usize, addr);
+        }
+    }
+
+    /// Gets the TLS area.
+    pub const fn tls(&self) -> usize {
+        self.fs_base as _
+    }
+
+    /// Sets the TLS area.
+    pub const fn set_tls(&mut self, tls_area: usize) {
+        self.fs_base = tls_area as _;
     }
 }
 
@@ -148,6 +204,7 @@ impl UspaceContext {
     pub unsafe fn enter_uspace(&self, kstack_top: VirtAddr) -> ! {
         super::disable_irqs();
         assert_eq!(super::tss_get_rsp0(), kstack_top);
+        super::tls::switch_to_user_fs_base(&self.0);
         unsafe {
             core::arch::asm!("
                 mov     rsp, {tf}
@@ -166,7 +223,7 @@ impl UspaceContext {
                 pop     r13
                 pop     r14
                 pop     r15
-                add     rsp, 16     // skip vector, error_code
+                add     rsp, 32     // skip fs_base, vector, error_code
                 swapgs
                 iretq",
                 tf = in(reg) &self.0,
@@ -252,7 +309,7 @@ impl fmt::Debug for ExtendedState {
 ///
 /// - Callee-saved registers
 /// - Stack pointer register
-/// - Thread pointer register (for thread-local storage, currently unsupported)
+/// - Thread pointer register (for kernel space thread-local storage)
 /// - FP/SIMD registers
 ///
 /// On context switch, current task saves its context from CPU to memory,
@@ -271,9 +328,11 @@ pub struct TaskContext {
     pub kstack_top: VirtAddr,
     /// `RSP` after all callee-saved registers are pushed.
     pub rsp: u64,
-    /// Thread Local Storage (TLS).
+    /// Thread pointer (FS segment base address)
     pub fs_base: usize,
-    /// The `gs_base` register value.
+    /// User space Thread pointer (GS segment base address)
+    ///
+    /// During task switching, it is written to `KernelGSBase` MSR.
     #[cfg(feature = "uspace")]
     pub gs_base: usize,
     /// Extended states, i.e., FP/SIMD states.
@@ -349,7 +408,7 @@ impl TaskContext {
             self.ext_state.save();
             next_ctx.ext_state.restore();
         }
-        #[cfg(any(feature = "tls", feature = "uspace"))]
+        #[cfg(any(feature = "tls"))]
         unsafe {
             self.fs_base = super::read_thread_pointer();
             super::write_thread_pointer(next_ctx.fs_base);

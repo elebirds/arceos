@@ -9,6 +9,8 @@ pub struct TrapFrame {
     pub r: [u64; 31],
     /// User Stack Pointer (SP_EL0).
     pub usp: u64,
+    /// Software Thread ID Register (TPIDR_EL0).
+    pub tpidr: u64,
     /// Exception Link Register (ELR_EL1).
     pub elr: u64,
     /// Saved Process Status Register (SPSR_EL1).
@@ -45,6 +47,56 @@ impl TrapFrame {
     pub const fn arg5(&self) -> usize {
         self.r[5] as _
     }
+
+    /// Sets the 5th syscall argument.
+    pub const fn set_arg5(&mut self, a5: usize) {
+        self.r[5] = a5 as _;
+    }
+
+    /// Gets the instruction pointer.
+    pub const fn ip(&self) -> usize {
+        self.elr as _
+    }
+
+    /// Sets the instruction pointer.
+    pub const fn set_ip(&mut self, pc: usize) {
+        self.elr = pc as _;
+    }
+
+    /// Gets the stack pointer.
+    pub const fn sp(&self) -> usize {
+        self.usp as _
+    }
+
+    /// Sets the stack pointer.
+    pub const fn set_sp(&mut self, sp: usize) {
+        self.usp = sp as _;
+    }
+
+    /// Gets the return value register.
+    pub const fn retval(&self) -> usize {
+        self.r[0] as _
+    }
+
+    /// Sets the return value register.
+    pub const fn set_retval(&mut self, r0: usize) {
+        self.r[0] = r0 as _;
+    }
+
+    /// Sets the return address.
+    pub const fn set_ra(&mut self, lr: usize) {
+        self.r[30] = lr as _;
+    }
+
+    /// Gets the TLS area.
+    pub const fn tls(&self) -> usize {
+        self.tpidr as _
+    }
+
+    /// Sets the TLS area.
+    pub const fn set_tls(&mut self, tls: usize) {
+        self.tpidr = tls as _;
+    }
 }
 
 /// Context to enter user space.
@@ -67,6 +119,7 @@ impl UspaceContext {
         Self(TrapFrame {
             r: regs,
             usp: ustack_top.as_usize() as _,
+            tpidr: 0,
             elr: entry as _,
             spsr: (SPSR_EL1::M::EL0t
                 + SPSR_EL1::D::Masked
@@ -128,12 +181,19 @@ impl UspaceContext {
             core::arch::asm!(
                 "
                 mov     sp, x1
-                ldp     x30, x9, [x0, 30 * 8]
-                ldp     x10, x11, [x0, 32 * 8]
-                msr     sp_el0, x9
-                msr     elr_el1, x10
-                msr     spsr_el1, x11
 
+                // backup kernel tpidr_el0
+                mrs     x1, tpidr_el0
+                msr     tpidrro_el0, x1
+
+                ldp     x11, x12, [x0, 33 * 8]
+                ldp     x9, x10, [x0, 31 * 8]
+                msr     sp_el0, x9
+                msr     tpidr_el0, x10
+                msr     elr_el1, x11
+                msr     spsr_el1, x12
+
+                ldr     x30, [x0, 30 * 8]
                 ldp     x28, x29, [x0, 28 * 8]
                 ldp     x26, x27, [x0, 26 * 8]
                 ldp     x24, x25, [x0, 24 * 8]
@@ -183,7 +243,7 @@ impl FpState {
 ///
 /// - Callee-saved registers
 /// - Stack pointer register
-/// - Thread pointer register (for thread-local storage, currently unsupported)
+/// - Thread pointer register (for kernel space thread-local storage)
 /// - FP/SIMD registers
 ///
 /// On context switch, current task saves its context from CPU to memory,
@@ -193,7 +253,6 @@ impl FpState {
 #[derive(Debug, Default)]
 pub struct TaskContext {
     pub sp: u64,
-    pub tpidr_el0: u64,
     pub r19: u64,
     pub r20: u64,
     pub r21: u64,
@@ -206,6 +265,8 @@ pub struct TaskContext {
     pub r28: u64,
     pub r29: u64,
     pub lr: u64, // r30
+    /// Thread pointer
+    pub tpidr_el0: u64,
     /// The `ttbr0_el1` register value, i.e., the page table root.
     #[cfg(feature = "uspace")]
     pub ttbr0_el1: memory_addr::PhysAddr,
@@ -247,6 +308,11 @@ impl TaskContext {
     /// It first saves the current task's context from CPU to this place, and then
     /// restores the next task's context from `next_ctx` to CPU.
     pub fn switch_to(&mut self, next_ctx: &Self) {
+        #[cfg(feature = "tls")]
+        {
+            self.tpidr_el0 = super::read_thread_pointer() as _;
+            unsafe { super::write_thread_pointer(next_ctx.tpidr_el0 as _) };
+        }
         #[cfg(feature = "fp_simd")]
         self.fp_state.switch_to(&next_ctx.fp_state);
         #[cfg(feature = "uspace")]
@@ -261,32 +327,32 @@ impl TaskContext {
 
 #[unsafe(naked)]
 unsafe extern "C" fn context_switch(_current_task: &mut TaskContext, _next_task: &TaskContext) {
-    naked_asm!(
-        "
-        // save old context (callee-saved registers)
-        stp     x29, x30, [x0, 12 * 8]
-        stp     x27, x28, [x0, 10 * 8]
-        stp     x25, x26, [x0, 8 * 8]
-        stp     x23, x24, [x0, 6 * 8]
-        stp     x21, x22, [x0, 4 * 8]
-        stp     x19, x20, [x0, 2 * 8]
-        mov     x19, sp
-        mrs     x20, tpidr_el0
-        stp     x19, x20, [x0]
+    unsafe {
+        naked_asm!(
+            "
+            // save old context (callee-saved registers)
+            stp     x29, x30, [x0, 11 * 8]
+            stp     x27, x28, [x0, 9 * 8]
+            stp     x25, x26, [x0, 7 * 8]
+            stp     x23, x24, [x0, 5 * 8]
+            stp     x21, x22, [x0, 3 * 8]
+            stp     x19, x20, [x0, 1 * 8]
+            mov     x19, sp
+            str     x19, [x0]
 
-        // restore new context
-        ldp     x19, x20, [x1]
-        mov     sp, x19
-        msr     tpidr_el0, x20
-        ldp     x19, x20, [x1, 2 * 8]
-        ldp     x21, x22, [x1, 4 * 8]
-        ldp     x23, x24, [x1, 6 * 8]
-        ldp     x25, x26, [x1, 8 * 8]
-        ldp     x27, x28, [x1, 10 * 8]
-        ldp     x29, x30, [x1, 12 * 8]
+            // restore new context
+            ldr     x19, [x1]
+            mov     sp, x19
+            ldp     x19, x20, [x1, 1 * 8]
+            ldp     x21, x22, [x1, 3 * 8]
+            ldp     x23, x24, [x1, 5 * 8]
+            ldp     x25, x26, [x1, 7 * 8]
+            ldp     x27, x28, [x1, 9 * 8]
+            ldp     x29, x30, [x1, 11 * 8]
 
-        ret",
-    )
+            ret",
+        )
+    }
 }
 
 #[unsafe(naked)]
